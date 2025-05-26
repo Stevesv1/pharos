@@ -36,7 +36,6 @@ const SWAP_CONTRACT = '0x1a4de519154ae51200b0ad7c90f7fac75547888a';
 const DECIMALS = { WPHRS: 18, USDC: 6 };
 const ACTION_AMOUNT = 0.001;
 
-
 const SWAP_ABI = [
   {
     inputs: [
@@ -89,7 +88,6 @@ const LIQUIDITY_ABI = [
     type: 'function',
   },
 ];
-
 
 const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
 
@@ -320,131 +318,173 @@ const makeRequest = async (url, options, maxRetries = 5) => {
 };
 
 async function swapTokens(wallet) {
-  try {
-    const amountWei = ethers.utils.parseUnits(ACTION_AMOUNT.toString(), DECIMALS.WPHRS);
-    const tokenContract = new ethers.Contract(WPHRS_TOKEN, ERC20_ABI, wallet);
+  const maxRetries = 5;
+  let attempt = 0;
 
-    const bal = await tokenContract.balanceOf(wallet.address);
-    if (bal.lt(amountWei)) {
-      log.warn(`Not enough WPHRS: ${ethers.utils.formatUnits(bal, DECIMALS.WPHRS)}`);
+  while (attempt < maxRetries) {
+    try {
+      const amountWei = ethers.utils.parseUnits(ACTION_AMOUNT.toString(), DECIMALS.WPHRS);
+      const tokenContract = new ethers.Contract(WPHRS_TOKEN, ERC20_ABI, wallet);
+
+      const bal = await tokenContract.balanceOf(wallet.address);
+      if (bal.lt(amountWei)) {
+        log.warn(`Not enough WPHRS: ${ethers.utils.formatUnits(bal, DECIMALS.WPHRS)}`);
+        return;
+      }
+
+      const allowed = await tokenContract.allowance(wallet.address, SWAP_CONTRACT);
+      if (allowed.lt(amountWei)) {
+        log.info('Approving swap contract...');
+        const approveTx = await tokenContract.approve(SWAP_CONTRACT, ethers.constants.MaxUint256);
+        await approveTx.wait();
+      }
+
+      const swapData = ethers.utils.defaultAbiCoder.encode(
+        ['address', 'address', 'uint256', 'address', 'uint256', 'uint256', 'uint256'],
+        [WPHRS_TOKEN, USDC_TOKEN, 500, wallet.address, amountWei, 0, 0]
+      );
+      const callData = [ethers.utils.hexConcat(['0x04e45aaf', swapData])];
+
+      const contract = new ethers.Contract(SWAP_CONTRACT, SWAP_ABI, wallet);
+      const expiry = Math.floor(Date.now() / 1000) + 300;
+
+      const gasLimit = await contract.estimateGas.multicall(expiry, callData);
+      const feeData = await provider.getFeeData();
+      const tx = await contract.multicall(expiry, callData, {
+        gasLimit: gasLimit.mul(12).div(10), // 20% buffer
+        gasPrice: feeData.gasPrice || ethers.utils.parseUnits('1', 'gwei'),
+      });
+
+      log.info('Swap transaction submitted...');
+      const receipt = await tx.wait();
+      log.success(`Swap successful: https://pharos-testnet.socialscan.io/tx/${receipt.transactionHash}`);
       return;
+    } catch (err) {
+      attempt++;
+      log.warn(`Swap attempt ${attempt} failed: ${err.message}`);
+      if (attempt < maxRetries) {
+        const delay = 5000 * attempt;
+        log.info(`Retrying swap in ${delay / 1000} seconds...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        log.error(`Max retries reached for swap. Failed: ${err.message}`);
+      }
     }
-
-    const allowed = await tokenContract.allowance(wallet.address, SWAP_CONTRACT);
-    if (allowed.lt(amountWei)) {
-      log.info('Approving swap contract...');
-      const approveTx = await tokenContract.approve(SWAP_CONTRACT, ethers.constants.MaxUint256);
-      await approveTx.wait();
-    }
-
-    const swapData = ethers.utils.defaultAbiCoder.encode(
-      ['address', 'address', 'uint256', 'address', 'uint256', 'uint256', 'uint256'],
-      [WPHRS_TOKEN, USDC_TOKEN, 500, wallet.address, amountWei, 0, 0]
-    );
-    const callData = [ethers.utils.hexConcat(['0x04e45aaf', swapData])];
-
-    const contract = new ethers.Contract(SWAP_CONTRACT, SWAP_ABI, wallet);
-    const expiry = Math.floor(Date.now() / 1000) + 300;
-
-    const gasLimit = await contract.estimateGas.multicall(expiry, callData);
-    const feeData = await provider.getFeeData();
-    const tx = await contract.multicall(expiry, callData, {
-      gasLimit: gasLimit.mul(12).div(10), // 20% buffer
-      gasPrice: feeData.gasPrice || ethers.utils.parseUnits('1', 'gwei'),
-    });
-
-    log.info('Swap transaction submitted...');
-    const receipt = await tx.wait();
-    log.success('Swap successful: ' + receipt.transactionHash);
-  } catch (err) {
-    log.error('Swap error: ' + err.message);
   }
 }
 
 async function addLiquidityPool(wallet) {
-  try {
-    const wphrsWei = ethers.utils.parseUnits(ACTION_AMOUNT.toString(), DECIMALS.WPHRS);
-    const usdcWei = ethers.utils.parseUnits(ACTION_AMOUNT.toString(), DECIMALS.USDC);
+  const maxRetries = 5;
+  let attempt = 0;
 
-    const wphrsContract = new ethers.Contract(WPHRS_TOKEN, ERC20_ABI, wallet);
-    const usdcContract = new ethers.Contract(USDC_TOKEN, ERC20_ABI, wallet);
+  while (attempt < maxRetries) {
+    try {
+      const wphrsWei = ethers.utils.parseUnits(ACTION_AMOUNT.toString(), DECIMALS.WPHRS);
+      const usdcWei = ethers.utils.parseUnits(ACTION_AMOUNT.toString(), DECIMALS.USDC);
 
-    const wphrsBal = await wphrsContract.balanceOf(wallet.address);
-    const usdcBal = await usdcContract.balanceOf(wallet.address);
-    if (wphrsBal.lt(wphrsWei) || usdcBal.lt(usdcWei)) {
-      log.warn('Insufficient funds for liquidity');
-      return;
-    }
+      const wphrsContract = new ethers.Contract(WPHRS_TOKEN, ERC20_ABI, wallet);
+      const usdcContract = new ethers.Contract(USDC_TOKEN, ERC20_ABI, wallet);
 
-    for (const [token, amount] of [
-      [WPHRS_TOKEN, wphrsWei],
-      [USDC_TOKEN, usdcWei],
-    ]) {
-      const contract = new ethers.Contract(token, ERC20_ABI, wallet);
-      const allowance = await contract.allowance(wallet.address, POSITION_MANAGER);
-      if (allowance.lt(amount)) {
-        log.info(`Approving ${token} for liquidity...`);
-        const tx = await contract.approve(POSITION_MANAGER, ethers.constants.MaxUint256);
-        await tx.wait();
+      const wphrsBal = await wphrsContract.balanceOf(wallet.address);
+      const usdcBal = await usdcContract.balanceOf(wallet.address);
+      if (wphrsBal.lt(wphrsWei) || usdcBal.lt(usdcWei)) {
+        log.warn('Insufficient funds for liquidity');
+        return;
+      }
+
+      for (const [token, amount] of [
+        [WPHRS_TOKEN, wphrsWei],
+        [USDC_TOKEN, usdcWei],
+      ]) {
+        const contract = new ethers.Contract(token, ERC20_ABI, wallet);
+        const allowance = await contract.allowance(wallet.address, POSITION_MANAGER);
+        if (allowance.lt(amount)) {
+          log.info(`Approving ${token} for liquidity...`);
+          const tx = await contract.approve(POSITION_MANAGER, ethers.constants.MaxUint256);
+          await tx.wait();
+        }
+      }
+
+      const manager = new ethers.Contract(POSITION_MANAGER, LIQUIDITY_ABI, wallet);
+      const params = {
+        token0: WPHRS_TOKEN,
+        token1: USDC_TOKEN,
+        fee: 3000,
+        tickLower: -60000,
+        tickUpper: 60000,
+        amount0Desired: wphrsWei,
+        amount1Desired: usdcWei,
+        amount0Min: 0,
+        amount1Min: 0,
+        recipient: wallet.address,
+        deadline: Math.floor(Date.now() / 1000) + 600,
+      };
+
+      const gasLimit = await manager.estimateGas.mint(params);
+      const feeData = await provider.getFeeData();
+      const tx = await manager.mint(params, {
+        gasLimit: gasLimit.mul(12).div(10),
+        gasPrice: feeData.gasPrice || ethers.utils.parseUnits('1', 'gwei'),
+      });
+
+      log.info('Liquidity transaction submitted...');
+      const receipt = await tx.wait();
+      log.success(`Liquidity added: https://pharos-testnet.socialscan.io/tx/${receipt.transactionHash}`);
+      return; 
+    } catch (err) {
+      attempt++;
+      log.warn(`Liquidity attempt ${attempt} failed: ${err.message}`);
+      if (attempt < maxRetries) {
+        const delay = 5000 * attempt;
+        log.info(`Retrying liquidity in ${delay / 1000} seconds...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        log.error(`Max retries reached for liquidity. Failed: ${err.message}`);
       }
     }
-
-    const manager = new ethers.Contract(POSITION_MANAGER, LIQUIDITY_ABI, wallet);
-    const params = {
-      token0: WPHRS_TOKEN,
-      token1: USDC_TOKEN,
-      fee: 3000,
-      tickLower: -60000,
-      tickUpper: 60000,
-      amount0Desired: wphrsWei,
-      amount1Desired: usdcWei,
-      amount0Min: 0,
-      amount1Min: 0,
-      recipient: wallet.address,
-      deadline: Math.floor(Date.now() / 1000) + 600,
-    };
-
-    const gasLimit = await manager.estimateGas.mint(params);
-    const feeData = await provider.getFeeData();
-    const tx = await manager.mint(params, {
-      gasLimit: gasLimit.mul(12).div(10),
-      gasPrice: feeData.gasPrice || ethers.utils.parseUnits('1', 'gwei'),
-    });
-
-    log.info('Liquidity transaction submitted...');
-    const receipt = await tx.wait();
-    log.success('Liquidity added: ' + receipt.transactionHash);
-  } catch (err) {
-    log.error('Liquidity error: ' + err.message);
   }
 }
 
 async function sendPhrs(wallet) {
-  try {
-    const amountWei = ethers.utils.parseEther(ACTION_AMOUNT.toString());
-    const recipient = ethers.Wallet.createRandom().address;
+  const maxRetries = 5;
+  let attempt = 0;
 
-    const bal = await provider.getBalance(wallet.address);
-    if (bal.lt(amountWei)) {
-      log.warn('Not enough PHRS for transfer');
+  while (attempt < maxRetries) {
+    try {
+      const amountWei = ethers.utils.parseEther(ACTION_AMOUNT.toString());
+      const recipient = ethers.Wallet.createRandom().address;
+
+      const bal = await provider.getBalance(wallet.address);
+      if (bal.lt(amountWei)) {
+        log.warn('Not enough PHRS for transfer');
+        return;
+      }
+
+      const nonce = await provider.getTransactionCount(wallet.address, 'pending');
+      const feeData = await provider.getFeeData();
+      const tx = await wallet.sendTransaction({
+        to: recipient,
+        value: amountWei,
+        gasLimit: 21000,
+        gasPrice: feeData.gasPrice || ethers.utils.parseUnits('1', 'gwei'),
+        nonce,
+      });
+
+      log.info('Transfer transaction submitted...');
+      const receipt = await tx.wait();
+      log.success(`Transfer successful: https://pharos-testnet.socialscan.io/tx/${receipt.transactionHash}`);
       return;
+    } catch (err) {
+      attempt++;
+      log.warn(`Transfer attempt ${attempt} failed: ${err.message}`);
+      if (attempt < maxRetries) {
+        const delay = 5000 * attempt;
+        log.info(`Retrying transfer in ${delay / 1000} seconds...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        log.error(`Max retries reached for transfer. Failed: ${err.message}`);
+      }
     }
-
-    const nonce = await provider.getTransactionCount(wallet.address, 'pending');
-    const feeData = await provider.getFeeData();
-    const tx = await wallet.sendTransaction({
-      to: recipient,
-      value: amountWei,
-      gasLimit: 21000,
-      gasPrice: feeData.gasPrice || ethers.utils.parseUnits('1', 'gwei'),
-      nonce,
-    });
-
-    log.info('Transfer transaction submitted...');
-    const receipt = await tx.wait();
-    log.success('Transfer successful: ' + receipt.transactionHash);
-  } catch (err) {
-    log.error('Transfer error: ' + err.message);
   }
 }
 
@@ -486,6 +526,7 @@ const processWallet = async (privateKey, index, total, useDelay, proxy = null) =
       await simulateHumanBehavior(useDelay);
 
       const loginUrl = `https://api.pharosnetwork.xyz/user/login?address=${address}&signature=${signature}&invite_code=${inviteCode}`;
+      console.log();
       log.info("Attempting login...");
 
       const loginOptions = {
@@ -517,6 +558,7 @@ const processWallet = async (privateKey, index, total, useDelay, proxy = null) =
       }
 
       const checkInUrl = `https://api.pharosnetwork.xyz/sign/in?address=${address}`;
+      console.log();
       log.info("Attempting daily check-in...");
 
       const checkInOptions = {
@@ -548,6 +590,7 @@ const processWallet = async (privateKey, index, total, useDelay, proxy = null) =
       }
 
       const faucetStatusUrl = `https://api.pharosnetwork.xyz/faucet/status?address=${address}`;
+      console.log();
       log.info("Checking faucet eligibility...");
 
       const faucetStatusOptions = {
@@ -597,12 +640,10 @@ const processWallet = async (privateKey, index, total, useDelay, proxy = null) =
         log.info("Faucet not available. Try again later");
       }
 
-      await simulateHumanBehavior(useDelay);
-      if (useDelay) {
-        await randomDelay(1000, 3000);
-      }
+      await new Promise(resolve => setTimeout(resolve, 3000));
 
       const balanceUrl = `https://api.socialscan.io/pharos-testnet/v1/explorer/address/${address}/profile`;
+      console.log();
       log.info("Fetching faucet balance...");
 
       const balanceOptions = {
@@ -625,10 +666,18 @@ const processWallet = async (privateKey, index, total, useDelay, proxy = null) =
       const balanceResponse = await makeRequest(balanceUrl, balanceOptions);
       const balanceData = await balanceResponse.json();
 
+      let sufficientBalance = false;
       if (balanceData?.balance) {
-        log.success(`Faucet Balance: ${colors.bright}${colors.yellow}${balanceData.balance} $PHRS${colors.reset} 💎`);
+        const balance = parseFloat(balanceData.balance);
+        log.success(`Faucet Balance: ${colors.bright}${colors.yellow}${balance} $PHRS${colors.reset} 💎`);
+        console.log();
+        if (balance >= 0.01) {
+          sufficientBalance = true;
+        } else {
+          log.warn(`Insufficient balance: ${balance} < 0.01 PHRS. Skipping on-chain tasks.`);
+        }
       } else {
-        log.warn("Could not fetch faucet balance");
+        log.warn("Could not fetch faucet balance. Skipping on-chain tasks.");
       }
 
       await simulateHumanBehavior(useDelay);
@@ -636,21 +685,27 @@ const processWallet = async (privateKey, index, total, useDelay, proxy = null) =
         await randomDelay(2000, 5000);
       }
 
-      log.header("Performing on-chain actions");
-      if (useDelay) {
-        await randomDelay(2000, 5000);
-      }
-      await swapTokens(wallet);
+      if (sufficientBalance) {
+        console.log();
+        log.header("==== Performing on-chain actions ====");
+        console.log();
+        if (useDelay) {
+          await randomDelay(2000, 5000);
+        }
+        await swapTokens(wallet);
 
-      if (useDelay) {
-        await randomDelay(2000, 5000);
-      }
-      await addLiquidityPool(wallet);
+        if (useDelay) {
+          await randomDelay(2000, 5000);
+        }
+        await addLiquidityPool(wallet);
 
-      if (useDelay) {
-        await randomDelay(2000, 5000);
+        if (useDelay) {
+          await randomDelay(2000, 5000);
+        }
+        await sendPhrs(wallet);
+      } else {
+        log.info("Skipping on-chain tasks due to insufficient balance.");
       }
-      await sendPhrs(wallet);
 
       await simulateHumanBehavior(useDelay);
       if (useDelay) {
@@ -658,6 +713,7 @@ const processWallet = async (privateKey, index, total, useDelay, proxy = null) =
       }
 
       const profileUrl = `https://api.pharosnetwork.xyz/user/profile?address=${address}`;
+      console.log();
       log.info("Fetching profile data...");
 
       const profileOptions = {
@@ -717,8 +773,8 @@ const main = async () => {
   ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝    ╚═════╝  ╚═════╝    ╚═╝   
   `);
 
-  log.info(`${colors.bright}Enhanced Multi-Wallet Automation Bot v4.0${colors.reset}`);
-  log.info(`${colors.bright}Features: Check-in, Faucet Claim, Swap, Liquidity, and Transfer with Proxy Support${colors.reset}`);
+  log.info(`${colors.bright}Enhanced Multi-Wallet Automation Bot${colors.reset}`);
+  log.info(`${colors.bright}Features: Check-in, Faucet Claim, Swap, Liquidity and Transfer with Proxy Support${colors.reset}`);
   log.info(`${colors.bright}By: Zun [@Zun2025]${colors.reset}`);
   log.separator();
 
@@ -732,7 +788,7 @@ const main = async () => {
 
   const privateKeys = loadPrivateKeys();
   const proxies = loadProxies();
-  console.log ();
+  console.log();
   log.info(`Loaded ${privateKeys.length} private keys from pk.txt`);
 
   if (proxies.length > 0) {
@@ -804,7 +860,6 @@ const main = async () => {
   log.separator();
 };
 
-// Error handling
 process.on('unhandledRejection', (reason) => {
   log.error(`Unhandled Rejection: ${reason}`);
 });
